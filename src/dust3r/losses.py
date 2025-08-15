@@ -1178,33 +1178,24 @@ def point_map_to_normal(point_map, mask, eps=1e-6):
 
     return normals, valids
 
-class HuberLoss(nn.Module):
-    def __init__(self, delta=1e-1, reduction="mean"):
-        super().__init__()
-        self.delta = delta
-        self.reduction = reduction
-    def forward(self, pred, target):
-        err = pred - target
-        abs_err = err.abs()
-        sq = 0.5 * err.pow(2) / self.delta
-        lin = abs_err - 0.5 * self.delta
-        loss = torch.where(abs_err <= self.delta, sq, lin)
-        if self.reduction == "mean":
-            return loss.mean()
-        if self.reduction == "sum":
-            return loss.sum()
-        return loss                  # 'none'
-
 class CameraLoss(nn.Module):
     def __init__(self, delta=1e-1, weights=(1.0, 1.0, 0.5)):
         super().__init__()
-        self.huber = HuberLoss(delta=delta)
         self.weights = weights
     def forward(self, pred_pose, gt_pose):
-        loss_T = self.huber(pred_pose[..., :3], gt_pose[..., :3])
-        loss_R = self.huber(pred_pose[..., 3:7], gt_pose[..., 3:7])
-        loss_fl = self.huber(pred_pose[..., 7:], gt_pose[..., 7:])
-        return (self.weights[0] * loss_T + self.weights[1] * loss_R + self.weights[2] * loss_fl)
+        loss_T = (pred_pose[..., :3] - gt_pose[..., :3]).abs()
+        loss_R = (pred_pose[..., 3:7] - gt_pose[..., 3:7]).abs()
+        loss_FL = (pred_pose[..., 7:] - gt_pose[..., 7:]).abs()
+
+        loss_T = check_and_fix_inf_nan(loss_T, "loss_T")
+        loss_R = check_and_fix_inf_nan(loss_R, "loss_R")
+        loss_FL = check_and_fix_inf_nan(loss_FL, "loss_FL")
+
+        # Clamp outlier translation loss to prevent instability, then average
+        loss_T = loss_T.clamp(max=100).mean()
+        loss_R = loss_R.mean()
+        loss_FL = loss_FL.mean()
+        return (self.weights[0] * loss_T + self.weights[1] * loss_R + self.weights[2] * loss_FL)
 
 class DepthOrPmapLoss(nn.Module):
     def __init__(self, alpha=0.01):
@@ -1213,7 +1204,7 @@ class DepthOrPmapLoss(nn.Module):
         self.grad_scales = 3
         self.gamma = 1.0 
 
-    def gradient_loss_multi_scale(self, pred, gt, mask):
+    def gradient_loss_multi_scale(self, pred, gt, mask=None):
         total = 0
         for s in range(self.grad_scales):
             step = 2 ** s
@@ -1223,13 +1214,13 @@ class DepthOrPmapLoss(nn.Module):
             total += self.normal_loss(pred_s, gt_s, mask_s)
         return total / self.grad_scales
 
-    def normal_loss(self, pred, gt, mask):
+    def normal_loss(self, pred, gt, mask=None):
         pred_norm, _ = point_map_to_normal(pred, mask)
         gt_norm, _ = point_map_to_normal(gt, mask)
         cos_sim = F.cosine_similarity(pred_norm, gt_norm, dim=-1)
         return 1 - cos_sim.mean()
 
-    def image_gradient_loss(self, pred, gt, mask):
+    def image_gradient_loss(self, pred, gt, mask=None):
         assert pred.dim() == 4 and pred.shape[-1] == 1
         assert gt.shape == pred.shape
 
@@ -1262,7 +1253,7 @@ class DepthOrPmapLoss(nn.Module):
 
         return (loss_dx + loss_dy) / 2
 
-    def forward(self, pred, gt, sigma_p, sigma_g, valid_mask):
+    def forward(self, pred, gt, sigma_p=None, sigma_g=None, valid_mask=None):
         if self.training:
             pred_normalized, _ = normalize_pointcloud(pred, valid_mask)
             gt_normalized, _ = normalize_pointcloud(gt, valid_mask)
@@ -1273,7 +1264,8 @@ class DepthOrPmapLoss(nn.Module):
         )
         pred_aligned = pred_normalized * scale + shift
         sigma_p = sigma_p.clamp(min=1e-6)
-        sigma_g = sigma_g.clamp(min=1e-6)
+        if sigma_g is not None:
+            sigma_g = sigma_g.clamp(min=1e-6)
         #sigma = 0.5 * (sigma_p + sigma_g)
         sigma = sigma_p
         diff = (pred_aligned - gt_normalized).abs()
@@ -1306,6 +1298,77 @@ class TrackLoss(nn.Module):
         l_vis = (w * l_vis).mean()
         return l_pos + l_vis
 
+class FinetuneLoss(MultiLoss):
+    def __init__(self, lambda_track=0.05):
+        super().__init__()
+        self.cam_loss = CameraLoss(
+            delta=0.1,
+            weights=(1.0, 1.0, 0.5)
+        )
+        self.depth_loss = DepthOrPmapLoss(alpha=0.1)
+
+    def get_name(self): return "FinetuneLoss"
+
+    def compute_loss(self, gts, preds,
+                     track_queries=None, track_preds=None):
+        # ---------- Lcamera ----------
+        T = []
+        for g in gts:
+            T_c2w = g['camera_pose'] 
+            if not torch.is_tensor(T_c2w):
+                T_c2w = torch.as_tensor(T_c2w)
+            dtype = T_c2w.dtype
+            device = T_c2w.device
+
+            R = T_c2w[..., :3, :3]  # [...,3,3]
+            t = T_c2w[..., :3, 3:4]  # [...,3,1]
+
+            # c2w -> w2c: R^T, -R^T t
+            R_w2c = R.transpose(-1, -2)  # [...,3,3]
+            t_w2c = -(R_w2c @ t)  # [...,3,1]
+            
+            eye = torch.eye(4, dtype=dtype, device=device)
+            T_w2c = eye.expand(*T_c2w.shape[:-2], 4, 4).clone()  # [...,4,4]
+            T_w2c[..., :3, :3] = R_w2c
+            T_w2c[..., :3, 3:4] = t_w2c
+
+            if T_w2c.dim() == 2:
+                T_w2c = T_w2c.unsqueeze(0)
+
+            T.append(T_w2c)  # [B,4,4]
+
+        T_view = torch.stack(T, dim=1)
+        T_c2w_first = torch.inverse(T_view[:, 0])  
+
+        T_wprime2c = T_view @ T_c2w_first.unsqueeze(1)  # [B,V,4,4]
+        camera_extrinsics_gt = T_wprime2c
+        camera_intrinsics_gt = torch.stack([g['camera_intrinsics'] for g in gts], dim=1) # b v 3 3
+        images_hw = gts[0]["img"].shape[-2:]
+        cam_gt = extri_intri_to_pose_encoding(camera_extrinsics_gt, camera_intrinsics_gt, images_hw)
+        cam_pr = torch.stack([p['camera_pose'] for p in preds], dim=1)
+
+        Lcamera = self.cam_loss(cam_pr, cam_gt)
+
+        # ---------- Ldepth ----------
+        depth_terms = []
+        for g,p in zip(gts, preds):
+            if ('depth' in p):
+                sigma_p = p['depth_conf']
+                valid_mask = g['valid_mask']
+                if not valid_mask.any():
+                    valid_mask = torch.ones_like(g['valid_mask'])
+                depth_terms.append(self.depth_loss(p['depth'], g['depthmap'].unsqueeze(-1), sigma_p=sigma_p, valid_mask=valid_mask))
+        Ldepth = torch.stack(depth_terms).mean() if depth_terms else torch.zeros_like(Lcamera)
+
+        total = Lcamera * 20 + Ldepth * 10
+        details = {}
+
+        details['Lcamera'] = float(Lcamera) * 20
+        details['Ldepth'] = float(Ldepth) * 10
+        details['total'] = float(total)
+
+        return total, details
+                         
 class DistillLoss(MultiLoss):
     def __init__(self, lambda_track=0.05):
         super().__init__()
