@@ -116,7 +116,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     'depth': predictions['depth'][:, s],  # [B, H, W, 1]
                     'depth_conf': predictions['depth_conf'][:, s],  # [B, H, W]
 
-                    'camera_pose': predictions['pose_enc'][:, s, :7],  # [B, 7]
+                    'camera_pose': predictions['pose_enc'][:, s, :],  # [B, 7]
 
                     **({'valid_mask': views[s]["valid_mask"]}
                         if 'valid_mask' in views[s] else {}),  # [B, H, W]
