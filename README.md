@@ -107,7 +107,7 @@ StreamVGGT
 ```
 
 ## Finetuning VGGT
-We also provide the following commands to fine-tune VGGT's point head if you like. 
+We also provide the following commands to fine-tune VGGT (excluding the track head) if you like. 
 ```bash
 cd src/
 NCCL_DEBUG=TRACE TORCH_DISTRIBUTED_DEBUG=DETAIL HYDRA_FULL_ERROR=1 accelerate launch --multi_gpu --main_process_port 26902 ./finetune.py --config-name finetune
